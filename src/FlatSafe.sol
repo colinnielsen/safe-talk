@@ -2,6 +2,10 @@
 pragma solidity 0.8.15;
 
 import "safe-contracts/external/GnosisSafeMath.sol";
+import "safe-contracts/interfaces/ERC1155TokenReceiver.sol";
+import "safe-contracts/interfaces/ERC721TokenReceiver.sol";
+import "safe-contracts/interfaces/ERC777TokensRecipient.sol";
+import "safe-contracts/interfaces/IERC165.sol";
 
 enum Operation {
     Call,
@@ -46,6 +50,10 @@ bytes32 constant GUARD_STORAGE_SLOT = 0x4a204f620c8c5ccdca3fd54d003badd85ba50043
 bytes32 constant DOMAIN_SEPARATOR_TYPEHASH = 0x47e79534a245952e8b16893a336b85a3d9ea9fa8c573f3d803afb92a79469218;
 // keccak256("SafeTx(address to,uint256 value,bytes data,uint8 operation,uint256 safeTxGas,uint256 baseGas,uint256 gasPrice,address gasToken,address refundReceiver,uint256 nonce)");
 bytes32 constant SAFE_TX_TYPEHASH = 0xbb8310d486368db6bd6f849402fdd73ad53d316b5a4b2644ad6efe0f941286d8;
+// keccak256("SafeMessage(bytes message)");
+bytes32 constant SAFE_MSG_TYPEHASH = 0x60b3cbf8b4a223d68d641b3b6ddf9a298e7f33710cf3d3a9d1146b5a6150fbca;
+bytes4 constant SIMULATE_SELECTOR = bytes4(keccak256("simulate(address,bytes)"));
+bytes4 constant UPDATED_MAGIC_VALUE = 0x1626ba7e;
 
 contract FlatSafe {
     using GnosisSafeMath for uint256;
@@ -750,5 +758,128 @@ contract FlatSafe {
     modifier authorized() {
         requireSelfCall();
         _;
+    }
+}
+
+/// @notice this contract is deployed with every safe deployed from the Safe UI
+contract CompatibilityFallbackHandler {
+    /// @notice CompatibilityFallbackHandler.isValidSignature / EIP1271.isValidSignature
+    function isValidSignature(bytes calldata _data, bytes calldata _signature) public view returns (bytes4) {
+        // Caller should be a Safe
+        FlatSafe safe = FlatSafe(payable(msg.sender));
+        bytes32 messageHash = getMessageHashForSafe(safe, _data);
+        if (_signature.length == 0) {
+            require(safe.signedMessages(messageHash) != 0, "Hash not approved");
+        } else {
+            safe.checkSignatures(messageHash, _data, _signature);
+        }
+        return EIP1271_MAGIC_VALUE;
+    }
+
+    /// @notice CompatibilityFallbackHandler.getMessageHash
+    function getMessageHash(bytes memory message) public view returns (bytes32) {
+        return getMessageHashForSafe(FlatSafe(payable(msg.sender)), message);
+    }
+
+    /// @notice CompatibilityFallbackHandler.getMessageHashForSafe
+    function getMessageHashForSafe(FlatSafe safe, bytes memory message) public view returns (bytes32) {
+        bytes32 safeMessageHash = keccak256(abi.encode(SAFE_MSG_TYPEHASH, keccak256(message)));
+        return keccak256(abi.encodePacked(bytes1(0x19), bytes1(0x01), safe.domainSeparator(), safeMessageHash));
+    }
+
+    /// @notice CompatibilityFallbackHandler.isValidSignature (OLD EIP-1271)
+    function isValidSignature(bytes32 _dataHash, bytes calldata _signature) external view returns (bytes4) {
+        ISignatureValidator validator = ISignatureValidator(msg.sender);
+        bytes4 value = validator.isValidSignature(abi.encode(_dataHash), _signature);
+        return (value == EIP1271_MAGIC_VALUE) ? UPDATED_MAGIC_VALUE : bytes4(0);
+    }
+
+    /// @notice CompatibilityFallbackHandler.getModules (GnosisSafe 1.1.1)
+    function getModules() external view returns (address[] memory) {
+        FlatSafe safe = FlatSafe(payable(msg.sender));
+        (address[] memory array,) = safe.getModulesPaginated(SENTINEL_MODULES, 10);
+        return array;
+    }
+
+    /// @notice CompatibilityFallbackHandler.simulate
+    function simulate(address targetContract, bytes calldata calldataPayload)
+        external
+        returns (bytes memory response)
+    {
+        targetContract;
+        calldataPayload;
+
+        assembly {
+            let internalCalldata := mload(0x40)
+            // Store `simulateAndRevert.selector`.
+            // String representation is used to force right padding
+            mstore(internalCalldata, "\xb4\xfa\xba\x09")
+            // Abuse the fact that both this and the internal methods have the
+            // same signature, and differ only in symbol name (and therefore,
+            // selector) and copy calldata directly. This saves us approximately
+            // 250 bytes of code and 300 gas at runtime over the
+            // `abi.encodeWithSelector` builtin.
+            calldatacopy(add(internalCalldata, 0x04), 0x04, sub(calldatasize(), 0x04))
+
+            // `pop` is required here by the compiler, as top level expressions
+            // can't have return values in inline assembly. `call` typically
+            // returns a 0 or 1 value indicated whether or not it reverted, but
+            // since we know it will always revert, we can safely ignore it.
+            pop(
+                call(
+                    gas(),
+                    caller(),
+                    0,
+                    internalCalldata,
+                    calldatasize(),
+                    // The `simulateAndRevert` call always reverts, and
+                    // instead encodes whether or not it was successful in the return
+                    // data. The first 32-byte word of the return data contains the
+                    // `success` value, so write it to memory address 0x00 (which is
+                    // reserved Solidity scratch space and OK to use).
+                    0x00,
+                    0x20
+                )
+            )
+
+            // Allocate and copy the response bytes, making sure to increment
+            // the free memory pointer accordingly (in case this method is
+            // called as an internal function). The remaining `returndata[0x20:]`
+            // contains the ABI encoded response bytes, so we can just write it
+            // as is to memory.
+            let responseSize := sub(returndatasize(), 0x20)
+            response := mload(0x40)
+            mstore(0x40, add(response, responseSize))
+            returndatacopy(response, 0x20, responseSize)
+
+            if iszero(mload(0x00)) { revert(add(response, 0x20), mload(response)) }
+        }
+    }
+
+    /// @notice DefaultCallbackHandler token receive functions
+    function onERC1155Received(address, address, uint256, uint256, bytes calldata) external pure returns (bytes4) {
+        return 0xf23a6e61;
+    }
+
+    function onERC1155BatchReceived(address, address, uint256[] calldata, uint256[] calldata, bytes calldata)
+        external
+        pure
+        returns (bytes4)
+    {
+        return 0xbc197c81;
+    }
+
+    function onERC721Received(address, address, uint256, bytes calldata) external pure returns (bytes4) {
+        return 0x150b7a02;
+    }
+
+    function tokensReceived(address, address, address, uint256, bytes calldata, bytes calldata) external pure {
+        // We implement this for completeness, doesn't really have any value
+    }
+
+    /// ERC-165 support
+    function supportsInterface(bytes4 interfaceId) external view virtual returns (bool) {
+        return interfaceId == type(ERC1155TokenReceiver).interfaceId
+            || interfaceId == type(ERC721TokenReceiver).interfaceId || interfaceId == type(IERC165).interfaceId;
     }
 }
